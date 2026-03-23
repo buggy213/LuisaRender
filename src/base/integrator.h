@@ -74,8 +74,12 @@ public:
         void render(Stream &stream) noexcept override;
     };
 
+private:
+    uint _samples_per_pass;
+
 public:
     ProgressiveIntegrator(Scene *scene, const SceneNodeDesc *desc) noexcept;
+    [[nodiscard]] auto samples_per_pass() const noexcept { return _samples_per_pass; }
 };
 
 }// namespace luisa::render

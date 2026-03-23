@@ -68,11 +68,17 @@ void ProgressiveIntegrator::Instance::_render_one_camera(
 
     using namespace luisa::compute;
 
-    Kernel2D render_kernel = [&](UInt frame_index, Float time, Float shutter_weight) noexcept {
+    auto samples_per_pass = node<ProgressiveIntegrator>()->samples_per_pass();
+
+    Kernel2D render_kernel = [&](UInt base_frame_index, Float time, Float shutter_weight) noexcept {
         set_block_size(16u, 16u, 1u);
         auto pixel_id = dispatch_id().xy();
-        auto L = Li(camera, frame_index, pixel_id, time);
-        camera->film()->accumulate(pixel_id, shutter_weight * L);
+        auto acc = def(make_float3(0.f));
+        $for(s, UInt(samples_per_pass)) {
+            auto L = Li(camera, base_frame_index + s, pixel_id, time);
+            acc += L;
+        };
+        camera->film()->accumulate(pixel_id, shutter_weight * acc, cast<float>(samples_per_pass));
     };
 
     Clock clock_compile;
@@ -82,7 +88,7 @@ void ProgressiveIntegrator::Instance::_render_one_camera(
     auto shutter_samples = camera->node()->shutter_samples();
     command_buffer << synchronize();
 
-    LUISA_INFO("Rendering started.");
+    LUISA_INFO("Rendering started (samples_per_pass = {}).", samples_per_pass);
     Clock clock;
     ProgressBar progress;
     progress.update(0.);
@@ -90,9 +96,10 @@ void ProgressiveIntegrator::Instance::_render_one_camera(
     auto sample_id = 0u;
     for (auto s : shutter_samples) {
         pipeline().update(command_buffer, s.point.time);
-        for (auto i = 0u; i < s.spp; i++) {
-            command_buffer << render(sample_id++, s.point.time, s.point.weight)
+        for (auto i = 0u; i < s.spp; i += samples_per_pass) {
+            command_buffer << render(sample_id, s.point.time, s.point.weight)
                                   .dispatch(resolution);
+            sample_id += samples_per_pass;
             dispatch_count++;
             if (camera->film()->show(command_buffer)) { dispatch_count = 0u; }
             auto dispatches_per_commit = 4u;
@@ -116,6 +123,7 @@ Float3 ProgressiveIntegrator::Instance::Li(const Camera::Instance *camera, Expr<
 }
 
 ProgressiveIntegrator::ProgressiveIntegrator(Scene *scene, const SceneNodeDesc *desc) noexcept
-    : Integrator{scene, desc} {}
+    : Integrator{scene, desc},
+      _samples_per_pass{std::max(desc->property_uint_or_default("samples_per_pass", 1u), 1u)} {}
 
 }// namespace luisa::render
