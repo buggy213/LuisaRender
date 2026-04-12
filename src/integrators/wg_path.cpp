@@ -207,6 +207,9 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
     auto rr_depth = node<WorkGraphPathTracing>()->rr_depth();
     auto rr_threshold = node<WorkGraphPathTracing>()->rr_threshold();
 
+    bool has_environment_light = pipeline().environment() != nullptr;
+    bool has_localized_light = !pipeline().lights().empty();
+
     WorkGraphBuilder builder{"wg-path-bounce"};
 
     // --- Entry node (BROADCASTING, dynamic dispatch grid) ---
@@ -216,8 +219,16 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
 
     // MaxRecords is per thread group, not per thread.
     // Each of the WG_BLOCK_SIZE threads may write to at most one of these outputs.
-    auto to_miss = entry.output<PostIntersectRecord>(WG_BLOCK_SIZE);
-    auto to_light = entry.output<PostIntersectRecord>(WG_BLOCK_SIZE);
+    luisa::optional<WorkGraphNodeOutput<PostIntersectRecord>> to_miss;
+    if (has_environment_light) {
+        to_miss = entry.output<PostIntersectRecord>(WG_BLOCK_SIZE);
+    }
+
+    luisa::optional<WorkGraphNodeOutput<PostIntersectRecord>> to_light;
+    if (has_localized_light) {
+        to_light = entry.output<PostIntersectRecord>(WG_BLOCK_SIZE);
+    }
+
     auto to_light_sample = entry.output<PostIntersectRecord>(WG_BLOCK_SIZE);
 
     WorkGraphNodeKernel entry_kernel = [&](Var<WGEntryRecord>) {
@@ -251,73 +262,73 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
             };
         };
 
-        // auto pixel_coord = make_uint2(post.pixel_id % resolution.x,
-        //                       post.pixel_id / resolution.x);
-        // camera->film()->accumulate(
-        //     pixel_coord,
-        //     ite(has_surface, Float3({1.0f, 0.0f, 0.0f}), Float3({0.0f, 0.0f, 1.0f})),
-        //     1.0f
-        // );
+        if (has_environment_light) {
+            to_miss->write(post, active & miss);
+        }
+        if (has_localized_light) {
+            to_light->write(post, active & !miss & has_light);
+        }
 
-        // if (pipeline().environment() != nullptr) {
-        //     to_miss.write(post, active & miss);
-        // }
-
-        to_miss.write(post, active & miss);
-        to_light.write(post, active & !miss & has_light);
         to_light_sample.write(post, active & !miss & !has_light & has_surface);
     };
     entry.define(entry_kernel);
 
     // --- Miss node ---
-    auto miss_node = builder.add_node<WorkGraphLaunchType::THREAD, PostIntersectRecord>("miss");
+    if (has_environment_light) {
+        auto miss_node = builder.add_node<WorkGraphLaunchType::THREAD, PostIntersectRecord>("miss");
 
-    WorkGraphNodeKernel miss_kernel = [&](Var<PostIntersectRecord> input) {
-        if (pipeline().environment()) {
-            auto wi = input.ray->direction();
-            auto u_wl = input.wl_sample;
-            auto swl = spectrum->sample(abs(u_wl));
-            $if(u_wl < 0.f) { swl.terminate_secondary(); };
-            auto beta = float4_to_spectrum(input.beta, dim);
-            auto pdf_bsdf = input.pdf_bsdf;
-            auto eval = light_sampler()->evaluate_miss(wi, swl, 0.f);
-            auto mis_weight = balance_heuristic(pdf_bsdf, eval.pdf);
-            auto Li = beta * eval.L * mis_weight;
-            auto pixel_coord = make_uint2(input.pixel_id % resolution.x,
-                                          input.pixel_id / resolution.x);
-            camera->film()->accumulate(pixel_coord, spectrum->srgb(swl, Li), 0.f);
-        }
-    };
-    miss_node.define(miss_kernel);
-    miss_node << to_miss;
+        WorkGraphNodeKernel miss_kernel = [&](Var<PostIntersectRecord> input) {
+            if (pipeline().environment()) {
+                auto wi = input.ray->direction();
+                auto u_wl = input.wl_sample;
+                auto swl = spectrum->sample(abs(u_wl));
+                $if(u_wl < 0.f) { swl.terminate_secondary(); };
+                auto beta = float4_to_spectrum(input.beta, dim);
+                auto pdf_bsdf = input.pdf_bsdf;
+                auto eval = light_sampler()->evaluate_miss(wi, swl, 0.f);
+                auto mis_weight = balance_heuristic(pdf_bsdf, eval.pdf);
+                auto Li = beta * eval.L * mis_weight;
+                auto pixel_coord = make_uint2(input.pixel_id % resolution.x,
+                                              input.pixel_id / resolution.x);
+                camera->film()->accumulate(pixel_coord, spectrum->srgb(swl, Li), 0.f);
+            }
+        };
+        miss_node.define(miss_kernel);
+        miss_node << *to_miss;
+    }
 
     // --- Light node ---
-    auto light_node = builder.add_node<WorkGraphLaunchType::THREAD, PostIntersectRecord>("light");
-    auto light_to_sample = light_node.output<PostIntersectRecord>(1);
+    luisa::optional<WorkGraphNode<WorkGraphLaunchType::THREAD, PostIntersectRecord>> light_node;
+    luisa::optional<WorkGraphNodeOutput<PostIntersectRecord>> light_to_sample;
 
-    WorkGraphNodeKernel light_kernel = [&](Var<PostIntersectRecord> input) {
-        if (!pipeline().lights().empty()) {
-            auto ray = input.ray;
-            auto hit = input.hit;
-            auto u_wl = input.wl_sample;
-            auto swl = spectrum->sample(abs(u_wl));
-            $if(u_wl < 0.f) { swl.terminate_secondary(); };
-            auto beta = float4_to_spectrum(input.beta, dim);
-            auto pdf_bsdf = input.pdf_bsdf;
-            auto it = pipeline().geometry()->interaction(ray, hit);
-            auto eval = light_sampler()->evaluate_hit(*it, ray->origin(), swl, 0.f);
-            auto mis_weight = balance_heuristic(pdf_bsdf, eval.pdf);
-            auto Li = beta * eval.L * mis_weight;
-            auto pixel_coord = make_uint2(input.pixel_id % resolution.x,
-                                          input.pixel_id / resolution.x);
-            camera->film()->accumulate(pixel_coord, spectrum->srgb(swl, Li), 0.f);
+    if (has_localized_light) {
+        light_node = builder.add_node<WorkGraphLaunchType::THREAD, PostIntersectRecord>("light");
+        light_to_sample = light_node->output<PostIntersectRecord>(1);
 
-            auto shape = pipeline().geometry()->instance(hit.inst);
-            light_to_sample.write(input, shape.has_surface());
-        }
-    };
-    light_node.define(light_kernel);
-    light_node << to_light;
+        WorkGraphNodeKernel light_kernel = [&](Var<PostIntersectRecord> input) {
+            if (!pipeline().lights().empty()) {
+                auto ray = input.ray;
+                auto hit = input.hit;
+                auto u_wl = input.wl_sample;
+                auto swl = spectrum->sample(abs(u_wl));
+                $if(u_wl < 0.f) { swl.terminate_secondary(); };
+                auto beta = float4_to_spectrum(input.beta, dim);
+                auto pdf_bsdf = input.pdf_bsdf;
+                auto it = pipeline().geometry()->interaction(ray, hit);
+                auto eval = light_sampler()->evaluate_hit(*it, ray->origin(), swl, 0.f);
+                auto mis_weight = balance_heuristic(pdf_bsdf, eval.pdf);
+                auto Li = beta * eval.L * mis_weight;
+                auto pixel_coord = make_uint2(input.pixel_id % resolution.x,
+                                              input.pixel_id / resolution.x);
+                camera->film()->accumulate(pixel_coord, spectrum->srgb(swl, Li), 0.f);
+
+                auto shape = pipeline().geometry()->instance(hit.inst);
+                light_to_sample->write(input, shape.has_surface());
+            }
+        };
+        light_node->define(light_kernel);
+        *light_node << *to_light;
+    }
 
     // --- LightSample node ---
     auto light_sample_node = builder.add_node<WorkGraphLaunchType::THREAD, PostIntersectRecord>("light_sample");
@@ -372,7 +383,9 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
     };
     light_sample_node.define(light_sample_kernel);
     light_sample_node << to_light_sample;
-    light_sample_node << light_to_sample;
+    if (has_localized_light) {
+        light_sample_node << *light_to_sample;
+    }
 
     // --- Surface node array ---
     auto surface_nodes = builder.add_node_array<WorkGraphLaunchType::THREAD, SurfaceRecord>(
