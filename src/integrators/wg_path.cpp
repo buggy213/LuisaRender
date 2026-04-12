@@ -51,7 +51,6 @@ struct SurfaceRecord {
     uint depth;
     float wl_sample;
     float4 beta;
-    float pdf_bsdf;
     Ray ray;
     Hit hit;
     float4 light_emission;
@@ -75,7 +74,7 @@ LUISA_STRUCT(luisa::render::PostIntersectRecord,
 
 LUISA_STRUCT(luisa::render::SurfaceRecord,
              pixel_id, sample_id, depth, wl_sample,
-             beta, pdf_bsdf, ray, hit,
+             beta, ray, hit,
              light_emission, light_wi, light_pdf, surface_tag){};
 
 LUISA_STRUCT(luisa::render::WGEntryRecord, size){};
@@ -123,7 +122,7 @@ public:
           _rr_depth{std::max(desc->property_uint_or_default("rr_depth", 2u), 0u)},
           _rr_threshold{std::max(desc->property_float_or_default("rr_threshold", 0.95f), 0.05f)},
           _unrolled{desc->property_bool_or_default("unrolled", false)},
-          _binning_mode{desc->property_string_or_default("material_binning", "full")} {}
+          _binning_mode{desc->property_string_or_default("material_binning", "single")} {}
 
     [[nodiscard]] auto max_depth() const noexcept { return _max_depth; }
     [[nodiscard]] auto rr_depth() const noexcept { return _rr_depth; }
@@ -175,6 +174,7 @@ private:
         const Buffer<IntersectRecord> &write_buffer,
         const Buffer<uint> &write_counter,
         const Buffer<uint> &active_count_buf,
+        const Buffer<uint> &debug_counter,
         uint max_dispatch_groups) noexcept;
 };
 
@@ -196,6 +196,7 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
     const Buffer<IntersectRecord> &write_buffer,
     const Buffer<uint> &write_counter,
     const Buffer<uint> &active_count_buf,
+    const Buffer<uint> &debug_counter,
     uint max_dispatch_groups) noexcept {
 
     auto spectrum = pipeline().spectrum();
@@ -213,20 +214,26 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
     entry.set_threadgroup_size({WG_BLOCK_SIZE, 1, 1});
     entry.set_max_dispatch_size({max_dispatch_groups, 1, 1});
 
-    auto to_miss = entry.output<PostIntersectRecord>(1);
-    auto to_light = entry.output<PostIntersectRecord>(1);
-    auto to_light_sample = entry.output<PostIntersectRecord>(1);
+    // MaxRecords is per thread group, not per thread.
+    // Each of the WG_BLOCK_SIZE threads may write to at most one of these outputs.
+    auto to_miss = entry.output<PostIntersectRecord>(WG_BLOCK_SIZE);
+    auto to_light = entry.output<PostIntersectRecord>(WG_BLOCK_SIZE);
+    auto to_light_sample = entry.output<PostIntersectRecord>(WG_BLOCK_SIZE);
 
     WorkGraphNodeKernel entry_kernel = [&](Var<WGEntryRecord>) {
         auto thread_id = dispatch_x();
         auto count = active_count_buf->read(0u);
 
-        $if(thread_id < count) {
+        Var<PostIntersectRecord> post;
+        Bool active = thread_id < count;
+        Bool miss = def(false);
+        Bool has_light = def(false);
+        Bool has_surface = def(false);
+        $if (active) {
             auto rec = read_buffer->read(thread_id);
             auto ray = rec.ray;
             auto hit = pipeline().geometry()->trace_closest(ray);
 
-            Var<PostIntersectRecord> post;
             post.pixel_id = rec.pixel_id;
             post.sample_id = rec.sample_id;
             post.depth = rec.depth;
@@ -236,21 +243,29 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
             post.ray = rec.ray;
             post.hit = hit;
 
-            $if(hit->miss()) {
-                to_miss.write(post, pipeline().environment() != nullptr);
-            }
-            $else {
+            miss = hit->miss();
+            $if (!miss) {
                 auto shape = pipeline().geometry()->instance(hit.inst);
-                $if(shape.has_light()) {
-                    to_light.write(post, true);
-                }
-                $else {
-                    $if(shape.has_surface()) {
-                        to_light_sample.write(post, true);
-                    };
-                };
+                has_light = shape.has_light();
+                has_surface = shape.has_surface();
             };
         };
+
+        // auto pixel_coord = make_uint2(post.pixel_id % resolution.x,
+        //                       post.pixel_id / resolution.x);
+        // camera->film()->accumulate(
+        //     pixel_coord,
+        //     ite(has_surface, Float3({1.0f, 0.0f, 0.0f}), Float3({0.0f, 0.0f, 1.0f})),
+        //     1.0f
+        // );
+
+        // if (pipeline().environment() != nullptr) {
+        //     to_miss.write(post, active & miss);
+        // }
+
+        to_miss.write(post, active & miss);
+        to_light.write(post, active & !miss & has_light);
+        to_light_sample.write(post, active & !miss & !has_light & has_surface);
     };
     entry.define(entry_kernel);
 
@@ -333,7 +348,6 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
         surf_rec.depth = input.depth;
         surf_rec.wl_sample = input.wl_sample;
         surf_rec.beta = input.beta;
-        surf_rec.pdf_bsdf = input.pdf_bsdf;
         surf_rec.ray = input.ray;
         surf_rec.hit = input.hit;
 
@@ -366,6 +380,8 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
 
     for (uint g = 0u; g < num_groups; g++) {
         WorkGraphNodeKernel surface_kernel = [&, g](Var<SurfaceRecord> input) {
+            // DEBUG: unconditional bump — did the surface node execute at all?
+            debug_counter->atomic(0u).fetch_add(1u);
             auto pixel_id = input.pixel_id;
             sampler()->load_state(pixel_id);
             auto u_lobe = sampler()->generate_1d();
@@ -497,16 +513,19 @@ void WorkGraphPathTracingInstance::_render_one_camera(
     auto tag_to_group = _compute_tag_to_group();
     auto num_groups = _num_groups(tag_to_group);
 
-    LUISA_INFO("Work graph path tracing: resolution={}x{}, spp={}, max_depth={}, "
-               "num_groups={}, binning={}",
-               resolution.x, resolution.y, spp, max_depth,
-               num_groups, node<WorkGraphPathTracing>()->binning_mode());
+    LUISA_INFO(
+        "Work graph path tracing: resolution={}x{}, spp={}, max_depth={}, "
+        "num_groups={}, binning={}",
+        resolution.x, resolution.y, spp, max_depth,
+        num_groups, node<WorkGraphPathTracing>()->binning_mode()
+    );
 
     // Buffers: entry always reads from read_buf, surface always writes to write_buf
     auto read_buf = device.create_buffer<IntersectRecord>(pixel_count);
     auto write_buf = device.create_buffer<IntersectRecord>(pixel_count);
     auto write_counter = device.create_buffer<uint>(1u);
     auto active_count_buf = device.create_buffer<uint>(1u);
+    auto debug_counter = device.create_buffer<uint>(1u);
 
     auto max_dispatch_groups = (pixel_count + WG_BLOCK_SIZE - 1u) / WG_BLOCK_SIZE;
 
@@ -517,7 +536,7 @@ void WorkGraphPathTracingInstance::_render_one_camera(
     auto wg = _build_multi_dispatch_graph(
         camera, tag_to_group, num_groups, resolution,
         read_buf, write_buf, write_counter, active_count_buf,
-        max_dispatch_groups);
+        debug_counter, max_dispatch_groups);
 
     LUISA_INFO("Compiling work graph...");
     Clock compile_clock;
@@ -528,7 +547,7 @@ void WorkGraphPathTracingInstance::_render_one_camera(
     Kernel1D ray_gen_kernel = [&](UInt base_spp, Float time, Float shutter_weight) noexcept {
         set_block_size(WG_BLOCK_SIZE, 1u, 1u);
         auto pixel_id = dispatch_x();
-        $if(pixel_id < pixel_count) {
+        $if (pixel_id < pixel_count) {
             auto pixel_coord = make_uint2(pixel_id % resolution.x,
                                           pixel_id / resolution.x);
             sampler()->start(pixel_coord, base_spp);
@@ -552,7 +571,7 @@ void WorkGraphPathTracingInstance::_render_one_camera(
             rec.ray = camera_sample.ray;
 
             read_buf->write(pixel_id, rec);
-            camera->film()->accumulate(pixel_coord, make_float3(0.f), 1.f);
+            // camera->film()->accumulate(pixel_coord, make_float3(0.f), 1.f);
         };
     };
     auto ray_gen = device.compile(ray_gen_kernel);
@@ -570,10 +589,12 @@ void WorkGraphPathTracingInstance::_render_one_camera(
     uint zero = 0u;
 
     auto sample_id = 0u;
+
+    LUISA_ASSERT(shutter_samples.size() == 1, "no motion blur for now");
     for (auto s : shutter_samples) {
         pipeline().update(command_buffer, s.point.time);
 
-        for (auto i = 0u; i < s.spp; i++) {
+        for (auto i = 0u; i < 1/* s.spp */; i++) {
             // Generate initial rays
             command_buffer << write_counter.copy_from(&zero);
             command_buffer << ray_gen(sample_id, s.point.time, s.point.weight)
@@ -591,9 +612,18 @@ void WorkGraphPathTracingInstance::_render_one_camera(
                 entry_rec.size = uint3(dispatch_groups, 1u, 1u);
                 command_buffer << program().dispatch(1, sizeof(WGEntryRecord), &entry_rec);
 
+                // Readback debug_counter to see how many paths actually reached shading node
+                uint h_debug_counter = 0;
+                command_buffer << debug_counter.copy_to(&h_debug_counter);
+                command_buffer << synchronize();
+
+                printf("bounce = %d, h_debug_counter = %d\n", bounce, h_debug_counter);
+
                 // Readback write_counter to see how many paths survive
                 command_buffer << write_counter.copy_to(&host_active_count);
                 command_buffer << synchronize();
+
+                LUISA_INFO("sample {}, bounce {}: host_active_count = {}", sample_id, bounce, host_active_count);
 
                 if (host_active_count == 0u) break;
 
