@@ -584,7 +584,7 @@ void WorkGraphPathTracingInstance::_render_one_camera(
             rec.ray = camera_sample.ray;
 
             read_buf->write(pixel_id, rec);
-            // camera->film()->accumulate(pixel_coord, make_float3(0.f), 1.f);
+            camera->film()->accumulate(pixel_coord, make_float3(0.f), 1.f);
         };
     };
     auto ray_gen = device.compile(ray_gen_kernel);
@@ -607,7 +607,7 @@ void WorkGraphPathTracingInstance::_render_one_camera(
     for (auto s : shutter_samples) {
         pipeline().update(command_buffer, s.point.time);
 
-        for (auto i = 0u; i < 1/* s.spp */; i++) {
+        for (auto i = 0u; i < s.spp; i++) {
             // Generate initial rays
             command_buffer << write_counter.copy_from(&zero);
             command_buffer << ray_gen(sample_id, s.point.time, s.point.weight)
