@@ -25,59 +25,77 @@ static constexpr uint WG_BLOCK_SIZE = 64u;
 // ============================================================================
 
 struct IntersectRecord {
+    float4 beta;
+    Ray ray;
     uint pixel_id;
     uint sample_id;
     uint depth;
     float wl_sample;
-    float4 beta;
     float pdf_bsdf;
-    Ray ray;
+    uint is_seed;
 };
 
 struct PostIntersectRecord {
+    float4 beta;
+    Ray ray;
     uint pixel_id;
     uint sample_id;
     uint depth;
     float wl_sample;
-    float4 beta;
-    float pdf_bsdf;
-    Ray ray;
     Hit hit;
+    float pdf_bsdf;
+    uint buf_flip;
 };
 
 struct SurfaceRecord {
+    float4 beta;
+    Ray ray;
     uint pixel_id;
     uint sample_id;
     uint depth;
     float wl_sample;
-    float4 beta;
-    Ray ray;
     Hit hit;
     float4 light_emission;
-    float3 light_wi;
+    // float3 decomposed to padding
+    float light_wi_x;
+    float light_wi_y;
+    float light_wi_z;
     float light_pdf;
     uint surface_tag;
+    uint buf_flip;
 };
 
-// Entry record for dynamic dispatch grid sizing
-struct WGEntryRecord : DispatchGridRecord {};
+// Entry record: dispatch grid size + per-dispatch constants
+struct WGEntryRecord : DispatchGridRecord {
+    uint buf_flip;
+    float time;
+    float shutter_weight;
+};
 
 }// namespace luisa::render
 
 LUISA_STRUCT(luisa::render::IntersectRecord,
+             beta, ray,
              pixel_id, sample_id, depth, wl_sample,
-             beta, pdf_bsdf, ray){};
+             pdf_bsdf,
+             is_seed) {};
 
 LUISA_STRUCT(luisa::render::PostIntersectRecord,
+             beta, ray,
              pixel_id, sample_id, depth, wl_sample,
-             beta, pdf_bsdf, ray, hit){};
+             hit,
+             pdf_bsdf,
+             buf_flip) {};
 
 LUISA_STRUCT(luisa::render::SurfaceRecord,
+             beta, ray,
              pixel_id, sample_id, depth, wl_sample,
-             beta, ray, hit,
-             light_emission, light_wi, light_pdf, surface_tag){};
+             hit,
+             light_emission, light_wi_x, light_wi_y, light_wi_z, light_pdf,
+             surface_tag,
+             buf_flip) {};
 
-LUISA_STRUCT(luisa::render::WGEntryRecord, size){};
+LUISA_STRUCT(luisa::render::WGEntryRecord, size, buf_flip, time, shutter_weight) {};
 
 namespace luisa::render {
 
@@ -170,8 +188,8 @@ private:
         const luisa::vector<uint> &tag_to_group,
         uint num_groups,
         uint2 resolution,
-        const Buffer<IntersectRecord> &read_buffer,
-        const Buffer<IntersectRecord> &write_buffer,
+        const Buffer<IntersectRecord> &buf_a,
+        const Buffer<IntersectRecord> &buf_b,
         const Buffer<uint> &write_counter,
         const Buffer<uint> &active_count_buf,
         uint max_dispatch_groups) noexcept;
@@ -191,8 +209,8 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
     const luisa::vector<uint> &tag_to_group,
     uint num_groups,
     uint2 resolution,
-    const Buffer<IntersectRecord> &read_buffer,
-    const Buffer<IntersectRecord> &write_buffer,
+    const Buffer<IntersectRecord> &buf_a,
+    const Buffer<IntersectRecord> &buf_b,
     const Buffer<uint> &write_counter,
     const Buffer<uint> &active_count_buf,
     uint max_dispatch_groups) noexcept {
@@ -204,6 +222,7 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
     auto max_depth = node<WorkGraphPathTracing>()->max_depth();
     auto rr_depth = node<WorkGraphPathTracing>()->rr_depth();
     auto rr_threshold = node<WorkGraphPathTracing>()->rr_threshold();
+    auto spp = camera->node()->spp();
 
     bool has_environment_light = pipeline().environment() != nullptr;
     bool has_localized_light = !pipeline().lights().empty();
@@ -229,9 +248,10 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
 
     auto to_light_sample = entry.output<PostIntersectRecord>(WG_BLOCK_SIZE);
 
-    WorkGraphNodeKernel entry_kernel = [&](Var<WGEntryRecord>) {
+    WorkGraphNodeKernel entry_kernel = [&](Var<WGEntryRecord> entry_rec) {
         auto thread_id = dispatch_x();
         auto count = active_count_buf->read(0u);
+        auto buf_flip = entry_rec.buf_flip;
 
         Var<PostIntersectRecord> post;
         Bool active = thread_id < count;
@@ -239,9 +259,38 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
         Bool has_light = def(false);
         Bool has_surface = def(false);
         $if (active) {
-            auto rec = read_buffer->read(thread_id);
-            auto ray = rec.ray;
-            auto hit = pipeline().geometry()->trace_closest(ray);
+            Var<IntersectRecord> rec;
+            $if (buf_flip == 0u) {
+                rec = buf_a->read(thread_id);
+            } $else {
+                rec = buf_b->read(thread_id);
+            };
+
+            // Inline raygen for seed records
+            $if (rec.is_seed != 0u) {
+                auto pixel_coord = make_uint2(rec.pixel_id % resolution.x,
+                                              rec.pixel_id / resolution.x);
+                sampler()->start(pixel_coord, rec.sample_id);
+                auto u_filter = sampler()->generate_pixel_2d();
+                auto u_lens = camera->node()->requires_lens_sampling()
+                                  ? sampler()->generate_2d()
+                                  : make_float2(.5f);
+                auto u_wavelength = spectrum->node()->is_fixed() ? 0.f : sampler()->generate_1d();
+                sampler()->save_state(rec.pixel_id);
+
+                auto camera_sample = camera->generate_ray(pixel_coord, entry_rec.time,
+                                                          u_filter, u_lens);
+                camera->film()->accumulate(pixel_coord, make_float3(0.f), 1.f);
+
+                rec.depth = 0u;
+                rec.wl_sample = u_wavelength;
+                rec.beta = spectrum_to_float4(
+                    SampledSpectrum{dim, entry_rec.shutter_weight * camera_sample.weight}, dim);
+                rec.pdf_bsdf = 1e16f;
+                rec.ray = camera_sample.ray;
+            };
+
+            auto hit = pipeline().geometry()->trace_closest(rec.ray);
 
             post.pixel_id = rec.pixel_id;
             post.sample_id = rec.sample_id;
@@ -251,6 +300,7 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
             post.pdf_bsdf = rec.pdf_bsdf;
             post.ray = rec.ray;
             post.hit = hit;
+            post.buf_flip = buf_flip;
 
             miss = hit->miss();
             $if (!miss) {
@@ -290,6 +340,19 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
                                               input.pixel_id / resolution.x);
                 camera->film()->accumulate(pixel_coord, spectrum->srgb(swl, Li), 0.f);
             }
+            // Path terminated — enqueue next sample seed if more remain
+            $if (input.sample_id + 1u < spp) {
+                Var<IntersectRecord> seed;
+                seed.pixel_id = input.pixel_id;
+                seed.sample_id = input.sample_id + 1u;
+                seed.is_seed = 1u;
+                auto slot = write_counter->atomic(0u).fetch_add(1u);
+                $if(input.buf_flip == 0u) {
+                    buf_b->write(slot, seed);
+                } $else {
+                    buf_a->write(slot, seed);
+                };
+            };
         };
         miss_node.define(miss_kernel);
         miss_node << *to_miss;
@@ -321,7 +384,21 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
                 camera->film()->accumulate(pixel_coord, spectrum->srgb(swl, Li), 0.f);
 
                 auto shape = pipeline().geometry()->instance(hit.inst);
-                light_to_sample->write(input, shape.has_surface());
+                auto has_surf = shape.has_surface();
+                // Path terminates here for pure emitters — enqueue next sample seed
+                $if(!has_surf & (input.sample_id + 1u < spp)) {
+                    Var<IntersectRecord> seed;
+                    seed.pixel_id = input.pixel_id;
+                    seed.sample_id = input.sample_id + 1u;
+                    seed.is_seed = 1u;
+                    auto slot = write_counter->atomic(0u).fetch_add(1u);
+                    $if(input.buf_flip == 0u) {
+                        buf_b->write(slot, seed);
+                    } $else {
+                        buf_a->write(slot, seed);
+                    };
+                };
+                light_to_sample->write(input, has_surf);
             }
         };
         light_node->define(light_kernel);
@@ -362,11 +439,15 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
 
         auto emission_spec = ite(occluded, SampledSpectrum{dim, 0.f}, light_sample.eval.L);
         surf_rec.light_emission = spectrum_to_float4(emission_spec, dim);
-        surf_rec.light_wi = light_sample.shadow_ray->direction();
+        auto light_wi = light_sample.shadow_ray->direction();
+        surf_rec.light_wi_x = light_wi.x;
+        surf_rec.light_wi_y = light_wi.y;
+        surf_rec.light_wi_z = light_wi.z;
         surf_rec.light_pdf = ite(occluded, 0.f, light_sample.eval.pdf);
 
         auto surface_tag = it->shape().surface_tag();
         surf_rec.surface_tag = surface_tag;
+        surf_rec.buf_flip = input.buf_flip;
 
         // Compile-time tag-to-group lookup
         auto group = def(0u);
@@ -431,7 +512,7 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
                 }
 
                 // Direct lighting
-                auto light_wi = input.light_wi;
+                auto light_wi = make_float3(input.light_wi_x, input.light_wi_y, input.light_wi_z);
                 auto pdf_light = input.light_pdf;
                 $if(pdf_light > 0.f) {
                     auto eval = closure->evaluate(wo, light_wi);
@@ -474,8 +555,8 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
                 terminated = true;
             };
 
-            // Write continuation to write_buffer
             $if(!terminated) {
+                // Write continuation ray to the opposite buffer
                 Var<IntersectRecord> cont;
                 cont.pixel_id = pixel_id;
                 cont.sample_id = input.sample_id;
@@ -484,9 +565,27 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
                 cont.beta = spectrum_to_float4(beta, dim);
                 cont.pdf_bsdf = new_pdf_bsdf;
                 cont.ray = new_ray;
+                cont.is_seed = 0u;
+                auto cont_slot = write_counter->atomic(0u).fetch_add(1u);
+                $if(input.buf_flip == 0u) {
+                    buf_b->write(cont_slot, cont);
+                } $else {
+                    buf_a->write(cont_slot, cont);
+                };
+            };
 
-                auto slot = write_counter->atomic(0u).fetch_add(1u);
-                write_buffer->write(slot, cont);
+            $if(terminated & input.sample_id + 1u < spp) {
+                // Path terminated — enqueue next sample seed
+                Var<IntersectRecord> seed;
+                seed.pixel_id = pixel_id;
+                seed.sample_id = input.sample_id + 1u;
+                seed.is_seed = 1u;
+                auto seed_slot = write_counter->atomic(0u).fetch_add(1u);
+                $if(input.buf_flip == 0u) {
+                    buf_b->write(seed_slot, seed);
+                } $else {
+                    buf_a->write(seed_slot, seed);
+                };
             };
         };
         surface_nodes[g].define(surface_kernel);
@@ -529,9 +628,9 @@ void WorkGraphPathTracingInstance::_render_one_camera(
         num_groups, node<WorkGraphPathTracing>()->binning_mode()
     );
 
-    // Buffers: entry always reads from read_buf, surface always writes to write_buf
-    auto read_buf = device.create_buffer<IntersectRecord>(pixel_count);
-    auto write_buf = device.create_buffer<IntersectRecord>(pixel_count);
+    // Ping-pong buffers — entry reads from one, all nodes write to the other; flipped each step
+    auto buf_a = device.create_buffer<IntersectRecord>(pixel_count);
+    auto buf_b = device.create_buffer<IntersectRecord>(pixel_count);
     auto write_counter = device.create_buffer<uint>(1u);
     auto active_count_buf = device.create_buffer<uint>(1u);
 
@@ -543,7 +642,7 @@ void WorkGraphPathTracingInstance::_render_one_camera(
     LUISA_INFO("Building work graph...");
     auto wg = _build_multi_dispatch_graph(
         camera, tag_to_group, num_groups, resolution,
-        read_buf, write_buf, write_counter, active_count_buf,
+        buf_a, buf_b, write_counter, active_count_buf,
         max_dispatch_groups);
 
     LUISA_INFO("Compiling work graph...");
@@ -551,96 +650,66 @@ void WorkGraphPathTracingInstance::_render_one_camera(
     auto program = device.compile(wg);
     LUISA_INFO("Work graph compiled in {} ms.", compile_clock.toc());
 
-    // Ray generation kernel: fills read_buf with initial camera rays
-    Kernel1D ray_gen_kernel = [&](UInt base_spp, Float time, Float shutter_weight) noexcept {
+    // Seed-fill kernel: write sample-0 seeds for all pixels into buf_a
+    Kernel1D seed_fill_kernel = [&]() noexcept {
         set_block_size(WG_BLOCK_SIZE, 1u, 1u);
-        auto pixel_id = dispatch_x();
-        $if (pixel_id < pixel_count) {
-            auto pixel_coord = make_uint2(pixel_id % resolution.x,
-                                          pixel_id / resolution.x);
-            sampler()->start(pixel_coord, base_spp);
-            auto u_filter = sampler()->generate_pixel_2d();
-            auto u_lens = camera->node()->requires_lens_sampling()
-                              ? sampler()->generate_2d()
-                              : make_float2(.5f);
-            auto u_wavelength = spectrum->node()->is_fixed() ? 0.f : sampler()->generate_1d();
-            sampler()->save_state(pixel_id);
-
-            auto camera_sample = camera->generate_ray(pixel_coord, time, u_filter, u_lens);
-
-            Var<IntersectRecord> rec;
-            rec.pixel_id = pixel_id;
-            rec.sample_id = base_spp;
-            rec.depth = 0u;
-            rec.wl_sample = u_wavelength;
-            rec.beta = spectrum_to_float4(
-                SampledSpectrum{dim, shutter_weight * camera_sample.weight}, dim);
-            rec.pdf_bsdf = 1e16f;
-            rec.ray = camera_sample.ray;
-
-            read_buf->write(pixel_id, rec);
-            camera->film()->accumulate(pixel_coord, make_float3(0.f), 1.f);
+        auto i = dispatch_x();
+        $if(i < pixel_count) {
+            Var<IntersectRecord> seed;
+            seed.pixel_id = i;
+            seed.sample_id = 0u;
+            seed.is_seed = 1u;
+            buf_a->write(i, seed);
         };
     };
-    auto ray_gen = device.compile(ray_gen_kernel);
+    auto seed_fill = device.compile(seed_fill_kernel);
 
     command_buffer << synchronize();
 
     // Render loop
     auto shutter_samples = camera->node()->shutter_samples();
+    LUISA_ASSERT(shutter_samples.size() == 1, "no motion blur for now");
+    auto s = shutter_samples[0];
+
     LUISA_INFO("Rendering started.");
     Clock render_clock;
     ProgressBar progress;
     progress.update(0.);
 
-    uint host_active_count = 0u;
     uint zero = 0u;
+    uint host_active_count = pixel_count;
 
-    auto sample_id = 0u;
+    pipeline().update(command_buffer, s.point.time);
 
-    LUISA_ASSERT(shutter_samples.size() == 1, "no motion blur for now");
-    for (auto s : shutter_samples) {
-        pipeline().update(command_buffer, s.point.time);
+    // Fill buf_a with initial seeds and prime the counters
+    command_buffer << write_counter.copy_from(&zero)
+                   << seed_fill().dispatch(pixel_count)
+                   << active_count_buf.copy_from(&host_active_count)
+                   << synchronize();
 
-        for (auto i = 0u; i < s.spp; i++) {
-            // Generate initial rays
-            command_buffer << write_counter.copy_from(&zero);
-            command_buffer << ray_gen(sample_id, s.point.time, s.point.weight)
-                                  .dispatch(pixel_count);
+    uint flip = 0u;
 
-            auto active_count = pixel_count;
-            host_active_count = active_count;
-            command_buffer << active_count_buf.copy_from(&host_active_count);
-            command_buffer << synchronize();
+    // Single unified loop: each step is one full wavefront across all in-flight paths.
+    // Terminated paths write seeds for their next sample, keeping occupancy high until
+    // all spp samples for all pixels are done.
+    while (host_active_count > 0u) {
+        auto dispatch_groups = (host_active_count + WG_BLOCK_SIZE - 1u) / WG_BLOCK_SIZE;
+        WGEntryRecord entry_rec{};
+        entry_rec.size = uint3(dispatch_groups, 1u, 1u);
+        entry_rec.buf_flip = flip;
+        entry_rec.time = s.point.time;
+        entry_rec.shutter_weight = s.point.weight;
+        command_buffer << program().dispatch(1, sizeof(WGEntryRecord), &entry_rec);
 
-            // Bounce loop with readback
-            for (auto bounce = 0u; bounce < max_depth; bounce++) {
-                auto dispatch_groups = (active_count + WG_BLOCK_SIZE - 1u) / WG_BLOCK_SIZE;
-                WGEntryRecord entry_rec{};
-                entry_rec.size = uint3(dispatch_groups, 1u, 1u);
-                command_buffer << program().dispatch(1, sizeof(WGEntryRecord), &entry_rec);
+        command_buffer << write_counter.copy_to(&host_active_count)
+                       << synchronize();
 
-                // Readback write_counter to see how many paths survive
-                command_buffer << write_counter.copy_to(&host_active_count);
-                command_buffer << synchronize();
+        if (host_active_count == 0u) break;
 
-                if (host_active_count == 0u) break;
-
-                // Copy surviving continuations from write_buf -> read_buf
-                command_buffer << read_buf.view(0, host_active_count)
-                                      .copy_from(write_buf.view(0, host_active_count));
-
-                // Reset write counter and update active count for next bounce
-                command_buffer << write_counter.copy_from(&zero);
-                active_count = host_active_count;
-                host_active_count = active_count;
-                command_buffer << active_count_buf.copy_from(&host_active_count);
-            }
-
-            sample_id++;
-            auto p = sample_id / static_cast<double>(spp);
-            // progress.update(p);
-        }
+        // No buffer copy — just flip which side is read vs write
+        command_buffer << write_counter.copy_from(&zero)
+                       << active_count_buf.copy_from(&host_active_count);
+        flip ^= 1u;
     }
 
     command_buffer << synchronize();
