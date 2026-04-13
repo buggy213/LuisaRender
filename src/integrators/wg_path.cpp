@@ -174,7 +174,6 @@ private:
         const Buffer<IntersectRecord> &write_buffer,
         const Buffer<uint> &write_counter,
         const Buffer<uint> &active_count_buf,
-        const Buffer<uint> &debug_counter,
         uint max_dispatch_groups) noexcept;
 };
 
@@ -196,7 +195,6 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
     const Buffer<IntersectRecord> &write_buffer,
     const Buffer<uint> &write_counter,
     const Buffer<uint> &active_count_buf,
-    const Buffer<uint> &debug_counter,
     uint max_dispatch_groups) noexcept {
 
     auto spectrum = pipeline().spectrum();
@@ -393,8 +391,6 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
 
     for (uint g = 0u; g < num_groups; g++) {
         WorkGraphNodeKernel surface_kernel = [&, g](Var<SurfaceRecord> input) {
-            // DEBUG: unconditional bump — did the surface node execute at all?
-            debug_counter->atomic(0u).fetch_add(1u);
             auto pixel_id = input.pixel_id;
             sampler()->load_state(pixel_id);
             auto u_lobe = sampler()->generate_1d();
@@ -538,7 +534,6 @@ void WorkGraphPathTracingInstance::_render_one_camera(
     auto write_buf = device.create_buffer<IntersectRecord>(pixel_count);
     auto write_counter = device.create_buffer<uint>(1u);
     auto active_count_buf = device.create_buffer<uint>(1u);
-    auto debug_counter = device.create_buffer<uint>(1u);
 
     auto max_dispatch_groups = (pixel_count + WG_BLOCK_SIZE - 1u) / WG_BLOCK_SIZE;
 
@@ -549,7 +544,7 @@ void WorkGraphPathTracingInstance::_render_one_camera(
     auto wg = _build_multi_dispatch_graph(
         camera, tag_to_group, num_groups, resolution,
         read_buf, write_buf, write_counter, active_count_buf,
-        debug_counter, max_dispatch_groups);
+        max_dispatch_groups);
 
     LUISA_INFO("Compiling work graph...");
     Clock compile_clock;
@@ -625,18 +620,9 @@ void WorkGraphPathTracingInstance::_render_one_camera(
                 entry_rec.size = uint3(dispatch_groups, 1u, 1u);
                 command_buffer << program().dispatch(1, sizeof(WGEntryRecord), &entry_rec);
 
-                // Readback debug_counter to see how many paths actually reached shading node
-                uint h_debug_counter = 0;
-                command_buffer << debug_counter.copy_to(&h_debug_counter);
-                command_buffer << synchronize();
-
-                printf("bounce = %d, h_debug_counter = %d\n", bounce, h_debug_counter);
-
                 // Readback write_counter to see how many paths survive
                 command_buffer << write_counter.copy_to(&host_active_count);
                 command_buffer << synchronize();
-
-                LUISA_INFO("sample {}, bounce {}: host_active_count = {}", sample_id, bounce, host_active_count);
 
                 if (host_active_count == 0u) break;
 
@@ -653,7 +639,7 @@ void WorkGraphPathTracingInstance::_render_one_camera(
 
             sample_id++;
             auto p = sample_id / static_cast<double>(spp);
-            progress.update(p);
+            // progress.update(p);
         }
     }
 
