@@ -113,6 +113,8 @@ public:
         Var<uint> data = samples << 8 | depth << 1 | extend_ray;
         _data->write(index, data);
     }
+
+    [[nodiscard]] auto &data_buffer() noexcept { return _data; }
 };
 
 class LightSampleSOA {
@@ -327,7 +329,7 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
         Bool has_light = def(false);
         Bool has_surface = def(false);
         $if (active) {
-            // active_count->atomic(0).fetch_add(1u);
+            active_count->atomic(0).fetch_add(1u);
 
             Var<Ray> ray;
 
@@ -373,14 +375,55 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
             };
         };
 
+        // Route hit results to downstream work graph nodes.
+        //
+        // Work graph nodes form a DAG — a path that isn't routed to any
+        // downstream node will never have its samples counter incremented,
+        // causing it to re-enter the entry node with extend_ray=1 forever.
+        // Every active path must either be routed or terminated inline here.
+        //
+        // Routing table (compile-time × runtime):
+        //
+        //   miss & env light       → miss node (evaluates environment + terminates)
+        //   miss & !env light      → terminate here (zero contribution)
+        //   hit & has_light        → light node (evaluates emission, forwards to
+        //                            light_sample if surface present, else terminates)
+        //   hit & has_surface      → light_sample node (NEE + surface shading)
+        //   hit & !light & !surf   → terminate here (degenerate geometry)
+
         if (has_environment_light) {
             to_miss->write(post, active & miss);
-        }
-        if (has_localized_light) {
-            to_light->write(post, active & !miss & has_light);
+        } else {
+            $if(active & miss) {
+                path_states.write_data(thread_id, samples + 1u, 0u, 0u);
+            };
         }
 
-        to_light_sample.write(post, active & !miss & !has_light & has_surface);
+        if (has_localized_light) {
+            to_light->write(post, active & !miss & has_light);
+        } else {
+            // Defensive: shouldn't happen (emissive geometry implies localized
+            // lights exist), but terminate pure emitters to avoid stuck paths.
+            $if(active & !miss & has_light & !has_surface) {
+                path_states.write_data(thread_id, samples + 1u, 0u, 0u);
+            };
+        }
+
+        // When the light node exists it handles has_light hits and forwards
+        // the ones with surfaces to light_sample itself. Without a light node,
+        // has_light & has_surface hits go to light_sample directly (skipping
+        // the emission MIS evaluation — acceptable since this case shouldn't
+        // arise in practice).
+        Bool route_to_light_sample = active & !miss & has_surface;
+        if (has_localized_light) {
+            route_to_light_sample = route_to_light_sample & !has_light;
+        }
+        to_light_sample.write(post, route_to_light_sample);
+
+        // Catch-all for geometry with neither surface nor light material.
+        $if(active & !miss & !has_light & !has_surface) {
+            path_states.write_data(thread_id, samples + 1u, 0u, 0u);
+        };
     };
     entry.define(entry_kernel);
 
@@ -672,20 +715,21 @@ void WorkGraphPathTracingInstance::_render_one_camera(
     LUISA_ASSERT(shutter_samples.size() == 1, "no motion blur for now");
     auto s = shutter_samples[0];
 
-    LUISA_INFO("Rendering started.");
-    Clock render_clock;
-    ProgressBar progress;
-    progress.update(0.);
 
-    uint previous_host_active_count = pixel_count;
+    uint zero = 0u;
     uint host_active_count = pixel_count;
 
     pipeline().update(command_buffer, s.point.time);
 
     // Zero out path_states and prime the counters
     command_buffer << seed_fill().dispatch(pixel_count)
-                   << active_count_buf.copy_from(&host_active_count)
+                   << active_count_buf.copy_from(&zero)
                    << synchronize();
+
+    LUISA_INFO("Rendering started.");
+    Clock render_clock;
+    ProgressBar progress;
+    progress.update(0.);
 
     // Single unified loop: each step is one full wavefront across all in-flight paths.
     // Terminated paths write seeds for their next sample, keeping occupancy high until
@@ -696,18 +740,70 @@ void WorkGraphPathTracingInstance::_render_one_camera(
         WGEntryRecord entry_rec{};
         entry_rec.size = uint3(dispatch_groups, 1u, 1u);
         command_buffer << program().dispatch(1, sizeof(WGEntryRecord), &entry_rec);
-        // command_buffer << active_count_buf.copy_to(&host_active_count)
-        //                << synchronize();
-        //
-        // if (host_active_count - previous_host_active_count == 0u) {
-        //     LUISA_INFO("stopping early due to no more work at iteration {}", i);
-        //     break;
+        command_buffer << active_count_buf.copy_to(&host_active_count)
+                       << synchronize();
+
+        command_buffer << active_count_buf.copy_from(&zero)
+                       << synchronize();
+
+        // if (i % 128 == 0) {
+        //     LUISA_INFO("{}% active at {}", (double)host_active_count * 100.0 / pixel_count, i);
         // }
-        //
-        // previous_host_active_count = host_active_count;
+
+        if (host_active_count == 0) {
+            command_buffer << synchronize();
+            LUISA_INFO("stopping early at {} due to all paths terminating", i);
+            break;
+        }
     }
 
-    command_buffer << synchronize();
+    // === Diagnostic: read back _data and check for stuck pixels ===
+    // {
+    //     luisa::vector<uint> host_data(pixel_count);
+    //     command_buffer << path_states.data_buffer().copy_to(host_data.data())
+    //                    << synchronize();
+    //
+    //     uint stuck_count = 0u;
+    //     uint zero_samples = 0u;
+    //     uint min_samples = spp;
+    //     uint max_samples = 0u;
+    //     uint extend_ray_set = 0u;
+    //     uint nonzero_depth = 0u;
+    //     luisa::vector<uint> sample_histogram(spp + 2u, 0u); // extra slot for overflow
+    //
+    //     for (auto p = 0u; p < pixel_count; p++) {
+    //         uint data = host_data[p];
+    //         uint s = data >> 8;
+    //         uint d = (data >> 1) & 0b1111111;
+    //         uint e = data & 1;
+    //
+    //         min_samples = std::min(min_samples, s);
+    //         max_samples = std::max(max_samples, s);
+    //         if (s == 0u) zero_samples++;
+    //         if (s < spp) stuck_count++;
+    //         if (e != 0u) extend_ray_set++;
+    //         if (d != 0u) nonzero_depth++;
+    //         sample_histogram[std::min(s, spp + 1u)]++;
+    //     }
+    //
+    //     LUISA_INFO("=== PATH STATE DIAGNOSTIC ===");
+    //     LUISA_INFO("  pixels: {}, target spp: {}", pixel_count, spp);
+    //     LUISA_INFO("  samples: min={}, max={}", min_samples, max_samples);
+    //     LUISA_INFO("  zero_samples: {} ({:.2f}%)", zero_samples, 100.0 * zero_samples / pixel_count);
+    //     LUISA_INFO("  incomplete (s < spp): {} ({:.2f}%)", stuck_count, 100.0 * stuck_count / pixel_count);
+    //     LUISA_INFO("  extend_ray still set: {}", extend_ray_set);
+    //     LUISA_INFO("  nonzero depth: {}", nonzero_depth);
+    //     LUISA_INFO("  sample histogram (first 16 bins):");
+    //     for (auto b = 0u; b < std::min((uint)sample_histogram.size(), 16u); b++) {
+    //         if (sample_histogram[b] > 0u) {
+    //             LUISA_INFO("    [{}] = {} ({:.2f}%)", b, sample_histogram[b],
+    //                        100.0 * sample_histogram[b] / pixel_count);
+    //         }
+    //     }
+    //     LUISA_INFO("=============================");
+    // }
+
+    // command_buffer << synchronize();
     progress.done();
 
     auto render_time = render_clock.toc();
