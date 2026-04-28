@@ -66,7 +66,8 @@ protected:
         auto u_lens = camera->node()->requires_lens_sampling() ? sampler()->generate_2d() : make_float2(.5f);
         auto [camera_ray, _, camera_weight] = camera->generate_ray(pixel_id, time, u_filter, u_lens);
         auto spectrum = pipeline().spectrum();
-        auto swl = spectrum->sample(spectrum->node()->is_fixed() ? 0.f : sampler()->generate_1d());
+        auto u_spectrum = spectrum->node()->is_fixed() ? def(0.0f) : sampler()->generate_1d();
+        auto swl = spectrum->sample(u_spectrum);
         SampledSpectrum beta{swl.dimension(), camera_weight};
         SampledSpectrum Li{swl.dimension()};
         Float eta_scale = def(1.f);
@@ -151,6 +152,8 @@ protected:
                 else {
                     reorder_shader_execution(coherence_hint, UInt(coherence_hint_bits));
                 }
+
+                swl = spectrum->sample(u_spectrum);
             }
 
             auto it = pipeline().geometry()->interaction(ray, closest_hit);
