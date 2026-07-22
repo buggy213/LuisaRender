@@ -17,6 +17,9 @@ private:
     uint _rr_depth;
     float _rr_threshold;
     bool _use_ser;
+    bool _ser_hit;
+    bool _ser_material;
+    bool _ser_rr;
 
 public:
     MegakernelPathTracing(Scene *scene, const SceneNodeDesc *desc) noexcept
@@ -24,11 +27,17 @@ public:
           _max_depth{std::max(desc->property_uint_or_default("depth", 10u), 1u)},
           _rr_depth{std::max(desc->property_uint_or_default("rr_depth", 0u), 0u)},
           _rr_threshold{std::max(desc->property_float_or_default("rr_threshold", 0.95f), 0.05f)},
-          _use_ser{desc->property_bool_or_default("use_ser", true)} {}
+          _use_ser{desc->property_bool_or_default("use_ser", true)},
+          _ser_hit{desc->property_bool_or_default("ser_hit", true)},
+          _ser_material{desc->property_bool_or_default("ser_material", true)},
+          _ser_rr{desc->property_bool_or_default("ser_rr", true)} {}
     [[nodiscard]] auto max_depth() const noexcept { return _max_depth; }
     [[nodiscard]] auto rr_depth() const noexcept { return _rr_depth; }
     [[nodiscard]] auto rr_threshold() const noexcept { return _rr_threshold; }
     [[nodiscard]] auto use_ser() const noexcept { return _use_ser; }
+    [[nodiscard]] auto ser_hit() const noexcept { return _ser_hit; }
+    [[nodiscard]] auto ser_material() const noexcept { return _ser_material; }
+    [[nodiscard]] auto ser_rr() const noexcept { return _ser_rr; }
     [[nodiscard]] luisa::string_view impl_type() const noexcept override { return LUISA_RENDER_PLUGIN_NAME; }
     [[nodiscard]] luisa::unique_ptr<Integrator::Instance> build(
         Pipeline &pipeline, CommandBuffer &command_buffer) const noexcept override;
@@ -57,7 +66,8 @@ protected:
         auto u_lens = camera->node()->requires_lens_sampling() ? sampler()->generate_2d() : make_float2(.5f);
         auto [camera_ray, _, camera_weight] = camera->generate_ray(pixel_id, time, u_filter, u_lens);
         auto spectrum = pipeline().spectrum();
-        auto swl = spectrum->sample(spectrum->node()->is_fixed() ? 0.f : sampler()->generate_1d());
+        auto u_spectrum = spectrum->node()->is_fixed() ? def(0.0f) : sampler()->generate_1d();
+        auto swl = spectrum->sample(u_spectrum);
         SampledSpectrum beta{swl.dimension(), camera_weight};
         SampledSpectrum Li{swl.dimension()};
         Float eta_scale = def(1.f);
@@ -70,6 +80,10 @@ protected:
             auto closest_hit = pipeline().geometry()->trace_closest(ray);
 
             bool use_ser = node<MegakernelPathTracing>()->use_ser();
+            bool ser_hit = node<MegakernelPathTracing>()->ser_hit();
+            bool ser_material = node<MegakernelPathTracing>()->ser_material();
+            bool ser_rr = node<MegakernelPathTracing>()->ser_rr();
+
             if (use_ser) {
                 // coherence hints, in order of decreasing priority
                 // 1. hit or miss
@@ -84,12 +98,10 @@ protected:
                 size_t surface_tag_count = pipeline().surfaces().size();
                 LUISA_ASSERT(surface_tag_count > 0u, "SER requires at least one surface.");
                 size_t surface_tag_bits = std::bit_width(next_pow2(surface_tag_count)) - 1u;
-                size_t coherence_hint_bits = 1 + 1 + 1 + surface_tag_bits + 1;
+                size_t coherence_hint_bits = 0;
                 UInt coherence_hint = def(0u);
 
                 Bool miss = closest_hit->miss();
-                coherence_hint |= (UInt(miss) << (1 + 1 + surface_tag_bits + 1));
-
                 Bool has_light;
                 Bool has_surface;
                 UInt surface_tag;
@@ -105,18 +117,43 @@ protected:
                     surface_tag = shape.surface_tag();
                 };
 
-                coherence_hint |= (UInt(has_light) << (1 + surface_tag_bits + 1));
-                coherence_hint |= (UInt(has_surface) << (surface_tag_bits + 1));
-                coherence_hint |= (surface_tag << 1u);
-
                 Float rr_survive_prob = max(beta.max() * eta_scale, .05f) * 0.8f;
                 Bool terminate =
                     depth == node<MegakernelPathTracing>()->max_depth() - 1u |
-                    (depth + 1u >= node<MegakernelPathTracing>()->rr_depth() & rr_survive_prob < 0.3f);
+                    depth + 1u >= node<MegakernelPathTracing>()->rr_depth() & rr_survive_prob < 0.3f;
 
-                coherence_hint |= UInt(terminate);
+                if (ser_hit) {
+                    coherence_hint <<= 1;
+                    coherence_hint |= UInt(miss);
+                    coherence_hint_bits += 1;
+                    coherence_hint <<= 1;
+                    coherence_hint |= UInt(has_light);
+                    coherence_hint_bits += 1;
+                    coherence_hint <<= 1;
+                    coherence_hint |= UInt(has_surface);
+                    coherence_hint_bits += 1;
+                }
 
-                reorder_shader_execution(coherence_hint, UInt(coherence_hint_bits));
+                if (ser_material) {
+                    coherence_hint <<= surface_tag_bits;
+                    coherence_hint |= surface_tag;
+                    coherence_hint_bits += surface_tag_bits;
+                }
+
+                if (ser_rr) {
+                    coherence_hint <<= 1;
+                    coherence_hint |= UInt(terminate);
+                    coherence_hint_bits += 1;
+                }
+
+                if (coherence_hint_bits == 0) {
+                    reorder_shader_execution();
+                }
+                else {
+                    reorder_shader_execution(coherence_hint, UInt(coherence_hint_bits));
+                }
+
+                swl = spectrum->sample(u_spectrum);
             }
 
             auto it = pipeline().geometry()->interaction(ray, closest_hit);

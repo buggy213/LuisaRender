@@ -737,6 +737,10 @@ void WorkGraphPathTracingInstance::_render_one_camera(
     LUISA_ASSERT(shutter_samples.size() == 1, "no motion blur for now");
     auto s = shutter_samples[0];
 
+    LUISA_INFO("Rendering started.");
+    Clock render_clock;
+    ProgressBar progress;
+    progress.update(0.);
 
     uint zero = 0u;
     uint host_active_count = pixel_count;
@@ -748,11 +752,6 @@ void WorkGraphPathTracingInstance::_render_one_camera(
                    << active_count_buf.copy_from(&zero)
                    << synchronize();
 
-    LUISA_INFO("Rendering started.");
-    Clock render_clock;
-    ProgressBar progress;
-    progress.update(0.);
-
     // Single unified loop: each step is one full wavefront across all in-flight paths.
     // Terminated paths write seeds for their next sample, keeping occupancy high until
     // all spp samples for all pixels are done.
@@ -762,6 +761,7 @@ void WorkGraphPathTracingInstance::_render_one_camera(
         WGEntryRecord entry_rec{};
         entry_rec.size = uint3(dispatch_groups, 1u, 1u);
         command_buffer << program().dispatch(1, sizeof(WGEntryRecord), &entry_rec);
+
         command_buffer << active_count_buf.copy_to(&host_active_count)
                        << synchronize();
 
