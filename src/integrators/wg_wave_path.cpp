@@ -208,7 +208,7 @@ public:
           _rr_depth{std::max(desc->property_uint_or_default("rr_depth", 2u), 0u)},
           _rr_threshold{std::max(desc->property_float_or_default("rr_threshold", 0.95f), 0.05f)},
           _unrolled{desc->property_bool_or_default("unrolled", false)},
-          _binning_mode{desc->property_string_or_default("material_binning", "single")} {}
+          _binning_mode{desc->property_string_or_default("material_binning", "material")} {}
 
     [[nodiscard]] auto max_depth() const noexcept { return _max_depth; }
     [[nodiscard]] auto rr_depth() const noexcept { return _rr_depth; }
@@ -237,10 +237,25 @@ private:
         auto num_surfaces = pipeline().surfaces().size();
         luisa::vector<uint> tag_to_group(num_surfaces);
         auto &mode = node<WorkGraphPathTracing>()->binning_mode();
+        uint current = 1u;
         if (mode == "single") {
             for (auto i = 0u; i < num_surfaces; i++) tag_to_group[i] = 0u;
         } else {
-            for (auto i = 0u; i < num_surfaces; i++) tag_to_group[i] = i;
+            for (auto i = 0u; i < num_surfaces; i++) {
+                auto type = pipeline().surfaces().impl(i)->node()->impl_type();
+                // printf("material: %s\n", type.data());
+                // if (type == "plastic" || type == "substrate") {
+                //     tag_to_group[i] = 1u;
+                // } else {
+                //     tag_to_group[i] = 0u;
+                // }
+                if (type == "matte") {
+                    tag_to_group[i] = 0u;
+                }
+                else {
+                    tag_to_group[i] = current++;
+                }
+            }
         }
         return tag_to_group;
     }
@@ -539,6 +554,13 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
         "surface", num_groups);
 
     for (uint g = 0u; g < num_groups; g++) {
+        luisa::vector<uint> group_tags;
+        for (uint i = 0u; i < tag_to_group.size(); i += 1) {
+            if (tag_to_group[i] == g) {
+                group_tags.push_back(i);
+            }
+        }
+
         WorkGraphNodeKernel surface_kernel = [&, g](Var<SurfaceRecord> input) {
             auto pixel_id = input.pixel_id;
             auto [samples, depth, _extend_ray] = path_states.read_data(pixel_id);
@@ -563,7 +585,7 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
             auto wo = -ray->direction();
 
             PolymorphicCall<Surface::Closure> call;
-            pipeline().surfaces().dispatch(surface_tag, [&](auto surface) noexcept {
+            pipeline().surfaces().dispatch_group(surface_tag, group_tags, [&](auto surface) noexcept {
                 surface->closure(call, *it, swl, wo, 1.f, 0.f);
             });
 

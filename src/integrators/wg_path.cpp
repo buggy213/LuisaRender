@@ -310,6 +310,7 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
             };
         };
 
+        // the below is definitely wrong; look at wg_wave_path for corrected
         if (has_environment_light) {
             to_miss->write(post, active & miss);
         }
