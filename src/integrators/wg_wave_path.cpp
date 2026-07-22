@@ -328,11 +328,10 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
         Bool has_surface = def(false);
         $if (active) {
             // active_count->atomic(0).fetch_add(1u);
-
             Var<Ray> ray;
 
             // Inline raygen
-            $if (extend_ray == 0u) {
+            $if (extend_ray == 0u) { 
                 auto pixel_coord = make_uint2(thread_id % resolution.x,
                                               thread_id / resolution.x);
                 sampler()->start(pixel_coord, samples);
@@ -696,15 +695,12 @@ void WorkGraphPathTracingInstance::_render_one_camera(
         WGEntryRecord entry_rec{};
         entry_rec.size = uint3(dispatch_groups, 1u, 1u);
         command_buffer << program().dispatch(1, sizeof(WGEntryRecord), &entry_rec);
+        command_buffer << synchronize();
         // command_buffer << active_count_buf.copy_to(&host_active_count)
-        //                << synchronize();
-        //
-        // if (host_active_count - previous_host_active_count == 0u) {
-        //     LUISA_INFO("stopping early due to no more work at iteration {}", i);
-        //     break;
-        // }
-        //
-        // previous_host_active_count = host_active_count;
+        //               << synchronize();
+        
+        // LUISA_INFO("active count: {}", host_active_count);
+        // break;
     }
 
     command_buffer << synchronize();

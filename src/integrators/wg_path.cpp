@@ -367,39 +367,37 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
         light_to_sample = light_node->output<PostIntersectRecord>(1);
 
         WorkGraphNodeKernel light_kernel = [&](Var<PostIntersectRecord> input) {
-            if (!pipeline().lights().empty()) {
-                auto ray = input.ray;
-                auto hit = input.hit;
-                auto u_wl = input.wl_sample;
-                auto swl = spectrum->sample(abs(u_wl));
-                $if(u_wl < 0.f) { swl.terminate_secondary(); };
-                auto beta = float4_to_spectrum(input.beta, dim);
-                auto pdf_bsdf = input.pdf_bsdf;
-                auto it = pipeline().geometry()->interaction(ray, hit);
-                auto eval = light_sampler()->evaluate_hit(*it, ray->origin(), swl, 0.f);
-                auto mis_weight = balance_heuristic(pdf_bsdf, eval.pdf);
-                auto Li = beta * eval.L * mis_weight;
-                auto pixel_coord = make_uint2(input.pixel_id % resolution.x,
-                                              input.pixel_id / resolution.x);
-                camera->film()->accumulate(pixel_coord, spectrum->srgb(swl, Li), 0.f);
+            auto ray = input.ray;
+            auto hit = input.hit;
+            auto u_wl = input.wl_sample;
+            auto swl = spectrum->sample(abs(u_wl));
+            $if(u_wl < 0.f) { swl.terminate_secondary(); };
+            auto beta = float4_to_spectrum(input.beta, dim);
+            auto pdf_bsdf = input.pdf_bsdf;
+            auto it = pipeline().geometry()->interaction(ray, hit);
+            auto eval = light_sampler()->evaluate_hit(*it, ray->origin(), swl, 0.f);
+            auto mis_weight = balance_heuristic(pdf_bsdf, eval.pdf);
+            auto Li = beta * eval.L * mis_weight;
+            auto pixel_coord = make_uint2(input.pixel_id % resolution.x,
+                                            input.pixel_id / resolution.x);
+            camera->film()->accumulate(pixel_coord, spectrum->srgb(swl, Li), 0.f);
 
-                auto shape = pipeline().geometry()->instance(hit.inst);
-                auto has_surf = shape.has_surface();
-                // Path terminates here for pure emitters — enqueue next sample seed
-                $if(!has_surf & (input.sample_id + 1u < spp)) {
-                    Var<IntersectRecord> seed;
-                    seed.pixel_id = input.pixel_id;
-                    seed.sample_id = input.sample_id + 1u;
-                    seed.is_seed = 1u;
-                    auto slot = write_counter->atomic(0u).fetch_add(1u);
-                    $if(input.buf_flip == 0u) {
-                        buf_b->write(slot, seed);
-                    } $else {
-                        buf_a->write(slot, seed);
-                    };
+            auto shape = pipeline().geometry()->instance(hit.inst);
+            auto has_surf = shape.has_surface();
+            // Path terminates here for pure emitters — enqueue next sample seed
+            $if(!has_surf & (input.sample_id + 1u < spp)) {
+                Var<IntersectRecord> seed;
+                seed.pixel_id = input.pixel_id;
+                seed.sample_id = input.sample_id + 1u;
+                seed.is_seed = 1u;
+                auto slot = write_counter->atomic(0u).fetch_add(1u);
+                $if(input.buf_flip == 0u) {
+                    buf_b->write(slot, seed);
+                } $else {
+                    buf_a->write(slot, seed);
                 };
-                light_to_sample->write(input, has_surf);
-            }
+            };
+            light_to_sample->write(input, has_surf);
         };
         light_node->define(light_kernel);
         *light_node << *to_light;
