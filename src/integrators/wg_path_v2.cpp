@@ -13,11 +13,14 @@
 #include <luisa/dsl/work_graph/work_graph_kernel.h>
 #include <luisa/backends/ext/work_graph_ext.h>
 #include <luisa/runtime/work_graph/work_graph_program.h>
+
+#include "backends/ext/native_resource_ext.hpp"
 #include "core/basic_traits.h"
 #include "core/basic_types.h"
 #include "dsl/builtin.h"
 #include "dsl/var.h"
 #include "dsl/work_graph/work_graph_types.h"
+#include "runtime/stream.h"
 
 namespace luisa::render {
 
@@ -213,23 +216,27 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
         auto pixel_coord = UInt2(thread_x, thread_y);
         auto subsample_depth = state.subsample_depth->read(thread_id);
         auto [subsample, depth] = unpack_subsample_depth(subsample_depth);
-        auto active = thread_x < resolution.x & thread_y < resolution.y;
+        auto active = thread_x < resolution.x & thread_y < resolution.y & subsample < spp;
         
-        Var<IntersectRecord> record = def(0u);
+        Var<IntersectRecord> record;
         auto eval_material = Bool(true);
         auto material_group = def(0u);
 
         $if(active) {
             $if(depth == 0u) {
+                state.live_paths->atomic(0).fetch_add(1u);
+
                 // regenerate ray
-                sampler()->start(pixel_coord, subsample);  
-                record.beta = make_float4(1.0f);
-                record.ray = camera->generate_ray(
+                sampler()->start(pixel_coord, subsample);
+                auto camera_sample = camera->generate_ray(
                     pixel_coord, 
                     0.0f, 
                     sampler()->generate_pixel_2d(), 
                     camera->node()->requires_lens_sampling() ? sampler()->generate_2d() : make_float2(0.0f)
                 );
+
+                record.beta = make_float4(camera_sample.weight);
+                record.ray = camera_sample.ray;
                 record.subsample_depth = pack_subsample_depth(subsample, depth);
                 record.thread_id = thread_id;
                 record.wl_sample = spectrum->node()->is_fixed() ? 0.5f : sampler()->generate_1d();
@@ -237,7 +244,7 @@ WorkGraph WorkGraphPathTracingInstance::_build_multi_dispatch_graph(
                 sampler()->save_state(thread_id);
 
                 auto swl = spectrum->sample(record.wl_sample);
-                camera->film()->accumulate(pixel_coord, make_float3(0.0f), 0.0f);
+                camera->film()->accumulate(pixel_coord, make_float3(0.0f), 1.0f);
             } $else {
                 // load path from SoA
                 record.beta = state.beta->read(thread_id);
@@ -493,40 +500,48 @@ void WorkGraphPathTracingInstance::_render_one_camera(CommandBuffer &command_buf
     ProgressBar progress;
     progress.update(0.);
 
-    uint zero = 0u;
-    uint host_active_count = pixel_count;
-
     pipeline().update(command_buffer, s.point.time);
 
-    // Fill buf_a with initial seeds and prime the counters
-    command_buffer << write_counter.copy_from(&zero)
-                   << seed_fill().dispatch(pixel_count)
-                   << active_count_buf.copy_from(&host_active_count)
-                   << synchronize();
+    // make GPU input record
+    auto dispatch_groups = (pixel_count + WG_BLOCK_SIZE - 1u) / WG_BLOCK_SIZE;
+    EntryRecord h_entry_rec { DispatchGridRecord(uint3(dispatch_groups, 1u, 1u)) };
+    Buffer<EntryRecord> d_entry_rec = device.create_buffer<EntryRecord>(1);
 
-    uint flip = 0u;
+    auto native_res = device.extension<NativeResourceExt>();
 
-    // Single unified loop: each step is one full wavefront across all in-flight paths.
-    // Terminated paths write seeds for their next sample, keeping occupancy high until
-    // all spp samples for all pixels are done.
-    while (host_active_count > 0u) {
-        auto dispatch_groups = (host_active_count + WG_BLOCK_SIZE - 1u) / WG_BLOCK_SIZE;
-        WGEntryRecord entry_rec{};
-        entry_rec.size = uint3(dispatch_groups, 1u, 1u);
-        entry_rec.buf_flip = flip;
-        entry_rec.time = s.point.time;
-        entry_rec.shutter_weight = s.point.weight;
-        command_buffer << program().dispatch(1, sizeof(WGEntryRecord), &entry_rec);
+    struct GPUInput {
+        uint entrypoint_index;
+        uint num_records;
+        uint64_t record_va;
+        uint64_t stride;
+    } h_gpu_input {
+        .entrypoint_index = 0,
+        .num_records = 1,
+        .record_va = native_res->get_device_address(d_entry_rec),
+        .stride = sizeof(EntryRecord),
+    };
+    Buffer<GPUInput> d_gpu_input = device.create_buffer<GPUInput>(1);
+    command_buffer << d_entry_rec.copy_from(&h_entry_rec) << d_gpu_input.copy_from(&h_gpu_input) << synchronize();
 
-        command_buffer << write_counter.copy_to(&host_active_count)
+    uint64_t d_gpu_input_addr = native_res->get_device_address(d_gpu_input);
+
+    // rendering loop
+    uint paths_started = 0;
+    uint total_paths = spp * pixel_count;
+    while (true) {
+        for (uint i = 0; i < max_depth; i += 1) {
+            command_buffer << program().dispatch(d_gpu_input_addr);
+        }
+
+        // this technically isn't fully accurate since live_paths is really more 
+        // "how many paths started in the previous `max_depth` iters"
+        // but it should be close enough for host to tell when its ok to stop integrating
+        command_buffer << state.live_paths.copy_to(&paths_started)
                        << synchronize();
 
-        if (host_active_count == 0u) break;
-
-        // No buffer copy — just flip which side is read vs write
-        command_buffer << write_counter.copy_from(&zero)
-                       << active_count_buf.copy_from(&host_active_count);
-        flip ^= 1u;
+        if (paths_started == 0u) break;
+        
+        progress.update(paths_started / (double)total_paths);
     }
 
     command_buffer << synchronize();
